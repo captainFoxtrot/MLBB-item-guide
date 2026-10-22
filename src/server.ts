@@ -16,6 +16,16 @@ const store=createStore(process.env.DB_FILE||'./data/mlbb-coach.sqlite');
 const streams=createStreamManager(store);
 const push=createPush(store);
 const analyses=new Map<string,number>();
+async function publishAdvice(token:string,result:Awaited<ReturnType<typeof analyzeScreenshot>>){
+  if(result.notificationQueued){
+    const title=result.adviceType==='core'?'MLBB Coach · Core':'MLBB Coach · Next item';
+    result.notification=await push.notify(token,title,`${result.nextItem} - ${result.reason}`);
+  }else{
+    result.notification={enabled:push.enabled,attempted:0,delivered:0,failed:0,expired:0,errors:[]};
+  }
+  store.saveLatestAnalysis(token,result);
+  return result;
+}
 const app=Fastify({logger:true, bodyLimit: 10*1024*1024});
 await app.register(staticPlugin,{root:join(root,'public'),prefix:'/'});
 const created=new Map<string,{count:number,until:number}>();
@@ -33,7 +43,7 @@ app.get<{Params:{id:string}}>('/api/devices/:id',async(req,reply)=>{
  const d=owner(req,reply);if(!d)return;
  const game=store.getGame(d.game_token)!;const latest=store.latestInstruction(game);
  reply.header('Cache-Control','no-store');
- return {id:d.id,paired:!!d.capture_hash,gameToken:game.token,status:game.status,revision:game.revision,instruction:latest?.text||null,roster:store.getRoster(game.token)};
+ return {id:d.id,paired:!!d.capture_hash,gameToken:game.token,status:game.status,revision:game.revision,instruction:latest?.text||null,roster:store.getRoster(game.token),analysis:store.getLatestAnalysis(game.token)};
 });
 app.post<{Params:{id:string}}>('/api/devices/:id/pair-code',async(req,reply)=>{
  const d=owner(req,reply);if(!d)return;
@@ -72,8 +82,7 @@ app.post<{Body:Buffer;Headers:{authorization?:string;'x-hero-hint'?:string}}>('/
  const last=analyses.get(token)||0;if(Date.now()-last<12000)return reply.code(429).send({error:'Wait 12 seconds between analyses'});
  analyses.set(token,Date.now());
  try{const result=await analyzeScreenshot(store,token,req.body,req.headers['x-hero-hint']);
-   if(result.screen==='scoreboard'&&result.confidence!=='low'&&result.nextItem!=='Need clearer scoreboard'&&store.getRoster(token).you!==null)await push.notify(token,result.instruction);
-   return result;
+   return await publishAdvice(token,result);
  }catch(err){req.log.error(err);return reply.code(502).send({error:err instanceof Error?err.message:'AI analysis failed'});}
 });
 app.post('/api/games',async(req,reply)=>{
@@ -86,9 +95,19 @@ app.get<{Params:{token:string}}>('/api/games/:token',async(req,reply)=>{
   const game=store.getGame(req.params.token);if(!game)return reply.code(404).send({error:'Unknown token'});
   reply.header('Cache-Control','no-store');
   const latest=store.latestInstruction(game);
-  return {token:game.token,status:game.status,revision:game.revision,instruction:latest?.text??null,updatedAt:latest?.created_at??game.updated_at,roster:store.getRoster(game.token)};
+  return {token:game.token,status:game.status,revision:game.revision,instruction:latest?.text??null,updatedAt:latest?.created_at??game.updated_at,roster:store.getRoster(game.token),analysis:store.getLatestAnalysis(game.token)};
 });
 app.get('/api/push/key',async()=>({publicKey:push.publicKey,enabled:push.enabled}));
+app.get<{Params:{id:string}}>('/api/devices/:id/push-status',async(req,reply)=>{
+ const d=owner(req,reply);if(!d)return;
+ const subs=store.getSubscriptions(d.game_token);
+ return {enabled:push.enabled,subscriptions:subs.length,lastDelivery:store.getLatestAnalysis(d.game_token)?.notification||null};
+});
+app.post<{Params:{id:string}}>('/api/devices/:id/test-push',async(req,reply)=>{
+ const d=owner(req,reply);if(!d)return;
+ const delivery=await push.notify(d.game_token,'MLBB Coach · Test','Test notification delivered successfully.');
+ return {ok:delivery.delivered>0,delivery};
+});
 app.post<{Params:{token:string};Body:{subscription:{endpoint:string;keys:{p256dh:string;auth:string}}}}>('/api/games/:token/push',async(req,reply)=>{
   if(!push.enabled)return reply.code(503).send({error:'Push not configured'});
   const sub=req.body?.subscription;
@@ -110,7 +129,7 @@ app.post<{Params:{token:string};Body:Buffer;Headers:{'x-mlbb-token'?:string;'x-h
   if(!Buffer.isBuffer(req.body)||req.body.length<1000)return reply.code(400).send({error:'Upload screenshot bytes as JPEG or PNG'});
   const last=analyses.get(token)||0;if(Date.now()-last<12000)return reply.code(429).send({error:'Wait 12 seconds between analyses'});
   analyses.set(token,Date.now());
-  try{const result=await analyzeScreenshot(store,token,req.body,req.headers['x-hero-hint']);if(result.screen==='scoreboard'&&result.confidence!=='low'&&result.nextItem!=='Need clearer scoreboard'&&store.getRoster(token).you!==null)await push.notify(token,result.instruction);return result;}
+  try{const result=await analyzeScreenshot(store,token,req.body,req.headers['x-hero-hint']);return await publishAdvice(token,result);}
   catch(err){req.log.error(err);return reply.code(502).send({error:err instanceof Error?err.message:'AI analysis failed'});}
 });
 app.post<{Params:{token:string}}>('/api/games/:token/new' ,async(req,reply)=>{

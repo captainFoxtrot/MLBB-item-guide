@@ -42,3 +42,33 @@ test('AI updates keep slot order and never overwrite manual hero or YOU selectio
  assert.equal(s.getRoster(d.gameToken).slots[2].hero,null);
  s.db.close();
 });
+
+test('same-team duplicate AI heroes are rejected without replacing manually selected slots',()=>{
+ const s=createStore(':memory:');const d=s.createDevice();
+ s.updateRosterManual(d.gameToken,{index:1,hero:'Karina'});
+ s.updateRosterManual(d.gameToken,{you:1});
+ s.applyRosterDetection(d.gameToken,{screen:'scoreboard',you:0,heroes:[
+  {side:'ally',position:0,hero:'Karina'},
+  {side:'ally',position:1,hero:'Freya'},
+  {side:'ally',position:2,hero:'Minotaur'},
+  {side:'enemy',position:2,hero:'Uranus'},
+  {side:'enemy',position:4,hero:'Uranus'}
+ ]});
+ const r=s.getRoster(d.gameToken);
+ assert.equal(r.you,1);
+ assert.equal(r.slots[1].hero,'Karina');
+ assert.equal(r.slots[0].hero,null);
+ assert.equal(r.slots[2].hero,'Minotaur');
+ assert.equal(r.slots[7].hero,'Uranus');
+ assert.equal(r.slots[9].hero,null);
+ s.db.close();
+});
+
+test('latest coaching analysis persists and resets with a new match',()=>{
+ const s=createStore(':memory:');const d=s.createDevice();
+ s.saveLatestAnalysis(d.gameToken,{nextItem:'Genius Wand',adviceStatus:'provisional'});
+ assert.equal(s.getLatestAnalysis(d.gameToken)?.nextItem,'Genius Wand');
+ s.newRound(d.gameToken);
+ assert.equal(s.getLatestAnalysis(d.gameToken),null);
+ s.db.close();
+});

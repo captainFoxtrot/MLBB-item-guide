@@ -43,6 +43,10 @@ export function createStore(file: string) {
     CREATE TABLE IF NOT EXISTS hero_rosters (
       game_id INTEGER PRIMARY KEY REFERENCES games(id), roster_json TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS game_analyses (
+      game_id INTEGER PRIMARY KEY REFERENCES games(id), result_json TEXT NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
     CREATE INDEX IF NOT EXISTS ix_push_game ON push_subscriptions(game_id);
     CREATE INDEX IF NOT EXISTS ix_instructions_game ON instructions(game_id, id DESC);
   `);
@@ -89,6 +93,17 @@ export function createStore(file: string) {
       db.prepare('UPDATE devices SET capture_hash=NULL,paired_at=NULL WHERE id=?').run(id);
       db.prepare('DELETE FROM pairing_codes WHERE device_id=?').run(id);
     },
+    getLatestAnalysis(token:string):Record<string,any>|null {
+      const game=this.getGame(token);if(!game)return null;
+      const row=db.prepare('SELECT result_json FROM game_analyses WHERE game_id=?').get(game.id) as {result_json:string}|undefined;
+      return row?JSON.parse(row.result_json):null;
+    },
+    saveLatestAnalysis(token:string,result:Record<string,unknown>){
+      const game=this.getGame(token);if(!game)throw Error('Unknown game');
+      db.prepare(`INSERT INTO game_analyses(game_id,result_json) VALUES (?,?)
+        ON CONFLICT(game_id) DO UPDATE SET result_json=excluded.result_json,updated_at=CURRENT_TIMESTAMP`)
+        .run(game.id,JSON.stringify(result));
+    },
     getRoster(token:string):Roster {
       const game=this.getGame(token);if(!game)throw Error('Unknown game');
       const row=db.prepare('SELECT roster_json FROM hero_rosters WHERE game_id=?').get(game.id) as {roster_json:string}|undefined;
@@ -118,13 +133,30 @@ export function createStore(file: string) {
     },
     applyRosterDetection(token:string,detected:{heroes?:Array<{side?:string;position?:number;hero?:string}>;you?:number|null;screen?:Screen}) {
       const roster=this.getRoster(token);
+      // Preserve manually corrected slots, then accept non-conflicting AI slots.
+      // A duplicate on the same team is almost always a recognition error.
+      // Across opposing teams, duplicates are permitted in non-draft modes.
+      const accepted = new Set<string>();
+      for(const slot of roster.slots){
+        if(slot.locked&&slot.hero)accepted.add(`${slot.side}:${slot.hero.toLocaleLowerCase()}`);
+      }
+      const seenPositions=new Set<number>();
       if(Array.isArray(detected.heroes))for(const h of detected.heroes){
         const pos=h.position;
         if(typeof pos!=='number'||!Number.isInteger(pos)||pos<0||pos>4)continue;
         const index=(h.side==='enemy'?5:h.side==='ally'?0:-1)+pos;
-        if(index<0||index>9||roster.slots[index].locked)continue;
+        if(index<0||index>9||seenPositions.has(index)||roster.slots[index].locked)continue;
+        seenPositions.add(index);
         const hero=normalizeHero(h.hero);
-        if(hero)roster.slots[index]={...roster.slots[index],hero,source:'ai'};
+        if(!hero)continue;
+        const identity=`${h.side}:${hero.toLocaleLowerCase()}`;
+        if(accepted.has(identity)){
+          // Do not retain a stale AI guess at a duplicate position.
+          roster.slots[index]={...roster.slots[index],hero:null,source:null};
+          continue;
+        }
+        accepted.add(identity);
+        roster.slots[index]={...roster.slots[index],hero,source:'ai'};
       }
       if(!roster.youLocked&&typeof detected.you==='number'&&Number.isInteger(detected.you)&&detected.you>=0&&detected.you<=4)roster.you=detected.you;
       if(['draft','loading','scoreboard','unknown'].includes(detected.screen||''))roster.screen=detected.screen!;
@@ -171,6 +203,7 @@ export function createStore(file: string) {
         statusGame.run('active', game.id);
         insertInstruction.run(game.id, 'New match started. Awaiting hero selection and draft screenshot.');
         db.prepare('DELETE FROM hero_rosters WHERE game_id=?').run(game.id);
+        db.prepare('DELETE FROM game_analyses WHERE game_id=?').run(game.id);
         updateGame.run(game.id);
         return get.get(game.token) as Game;
       })();
