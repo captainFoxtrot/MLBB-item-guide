@@ -10,7 +10,8 @@ import { analyzeScreenshot } from './coach.js';
 import { createPush } from './push.js';
 import { HEROES } from './roster.js';
 import { authorizeOwner } from './device.js';
-import { applyPending, candidates, decide, enemyFromRoster, heroFromRoster, initialCore, type Rating } from './threat-coach.js';
+import { candidates, enemyFromRoster, heroFromRoster, initialCore, type Rating } from './threat-coach.js';
+import { buildRoute, routeChange, isStrength, type Strength, type RouteItem } from './build-route.js';
 
 const root=fileURLToPath(new URL('../',import.meta.url));
 const store=createStore(process.env.DB_FILE||'./data/mlbb-coach.sqlite');
@@ -85,34 +86,34 @@ app.patch<{Params:{id:string};Body:{index?:number;hero?:string|null;you?:number|
  try{return {roster:store.updateRosterManual(d.game_token,body)};}
  catch(e){return reply.code(400).send({error:e instanceof Error?e.message:'Invalid roster'});}
 });
-// v3: one loading screenshot, then explicit enemy threat ratings and a stateful assumed inventory.
-app.post<{Params:{id:string};Body:{ratings?:Record<string,Rating>}}>('/api/devices/:id/threats',async(req,reply)=>{
+// v3.1: full eight-item route; no inferred purchases from repeated threat updates.
+app.post<{Params:{id:string};Body:{ratings?:Record<string,Rating>;strength?:Strength}}>('/api/devices/:id/threats',async(req,reply)=>{
  const d=owner(req,reply);if(!d)return;
  const token=d.game_token,roster=store.getRoster(token),hero=heroFromRoster(roster);
  if(!hero)return reply.code(409).send({error:'Select your hero in Edit draft first'});
  const enemies=roster.slots.slice(5).map(s=>s.hero).filter((s):s is string=>!!s);
- if(enemies.length!==5)return reply.code(409).send({error:'Identify all five enemies in Edit draft first'});
- const ratings=req.body?.ratings;
+ if(enemies.length!==5)return reply.code(409).send({error:'Identify all five enemies first'});
+ const ratings=req.body?.ratings,strength=req.body?.strength??'equal';
  if(!ratings||typeof ratings!=='object'||Array.isArray(ratings))return reply.code(400).send({error:'Threat ratings required'});
+ if(!isStrength(strength))return reply.code(400).send({error:'Invalid relative strength'});
  if(Object.keys(ratings).some(h=>!enemies.includes(h)||![null,'weak','gaining','strong'].includes(ratings[h])))return reply.code(400).send({error:'Invalid hero or rating'});
  if(threatRequests.has(token))return reply.code(409).send({error:'Recommendation already processing'});
  threatRequests.add(token);
  try{
-  let state=store.getThreatState(token);
-  if(!state.initialized){state.core=initialCore(hero);state.assumed=[...state.core];state.initialized=true;}
-  else state=applyPending(state);
+  const state=store.getThreatState(token);
+  const previous=(state as any).route?.items as RouteItem[]|undefined;
   state.ratings=Object.fromEntries(enemies.map(h=>[h,ratings[h]||null]));
-  const decision=decide(hero,enemyFromRoster(roster,state.ratings),state.assumed,state.core);
-  state.pending=decision.action==='KEEP'?null:decision;
-  state.last=decision;
-  state.history.push({at:new Date().toISOString(),decision});
-  if(state.history.length>30)state.history=state.history.slice(-30);
-  const instruction=decision.action==='KEEP'?'KEEP: '+decision.reason:decision.action==='SWAP'?`SWAP: ${decision.replace} → ${decision.item} — ${decision.reason}`:`NEXT: ${decision.item} — ${decision.reason}`;
+  state.core=initialCore(hero);state.initialized=true;
+  state.assumed=[];state.pending=null;state.last=null;
+  const route=buildRoute(hero,enemyFromRoster(roster,state.ratings),strength);
+  const change=routeChange(previous,route);
+  (state as any).route=route;
+  (state as any).strength=strength;
+  const instruction=`BUILD: ${route.recommended.map(x=>x.item).join(' > ')} | ALT: ${route.alternatives.map(x=>x.item).join(', ')}`;
   store.setInstruction(token,instruction.slice(0,750));
-  // Save the decision before sending so a failed push does not erase the progression.
   store.saveThreatState(token,state);
-  const delivery=await push.notify(token,`MLBB Coach · ${decision.action}`,instruction.slice(0,220));
-  return {ok:true,hero,decision,assumed:state.assumed,pending:state.pending,delivery,threats:state};
+  const delivery=change.notify?await push.notify(token,change.title,change.body.slice(0,220)):{enabled:push.enabled,attempted:0,delivered:0,failed:0,expired:0,errors:[]};
+  return {ok:true,hero,route,change,delivery,threats:state};
  }catch(e){req.log.error(e);return reply.code(500).send({error:e instanceof Error?e.message:'Coaching failed'});}
  finally{threatRequests.delete(token);}
 });

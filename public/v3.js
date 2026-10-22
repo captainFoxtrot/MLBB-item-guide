@@ -2,7 +2,7 @@
 const token=decodeURIComponent(location.pathname.split('/').pop());
 let device=null;try{const d=JSON.parse(localStorage.getItem('mlbb-device-v21')||'null');if(d?.id&&d?.ownerKey&&d.gameToken===token)device=d;}catch{}
 const $=id=>document.getElementById(id),levels=['weak','gaining','strong'];
-let roster=null,threatState=null,suggestedCore=[],ratings={},allHeroes=[],busy=false,loaded=false,lastRevision=-1,dirty=false;
+let roster=null,threatState=null,ratings={},strength='equal',allHeroes=[],busy=false,loaded=false,lastRevision=-1,dirty=false;
 $('classicLink').href='/classic/'+encodeURIComponent(token);
 async function api(path,method='GET',body){const headers={};if(device)headers.Authorization='Bearer '+device.ownerKey;if(body!==undefined)headers['Content-Type']='application/json';const res=await fetch(path,{method,headers,body:body===undefined?undefined:JSON.stringify(body),cache:'no-store'});const data=await res.json().catch(()=>({}));if(!res.ok)throw Error(data.error||`Request failed (${res.status})`);return data;}
 function currentHero(){return roster?.you==null?null:roster.slots[roster.you]?.hero||null;}
@@ -19,29 +19,31 @@ function renderBoard(){
   levels.forEach(state=>{const b=document.createElement('button');b.className='rating'+(level===state?' active':'');b.dataset.rating=state;b.textContent=state[0].toUpperCase()+state.slice(1);b.setAttribute('aria-pressed',String(level===state));b.onclick=()=>{ratings[name]=ratings[name]===state?null:state;dirty=true;renderBoard();renderSend();};group.append(b);});card.append(group);root.append(card);
  });
 }
-function renderSend(){const ready=!!device&&!!currentHero()&&enemies().length===5&&!busy;$('send').disabled=!ready;$('send').querySelector('span').textContent=busy?'Sending…':'Send update';}
-function renderThreats(){
- const hero=currentHero();$('myHero').textContent=hero||'Select your hero';
- const core=threatState?.core?.length?threatState.core:suggestedCore;
- $('core').textContent=core.join(' · ')||'Awaiting hero selection';
- const owned=$('owned');owned.replaceChildren();const items=threatState?.assumed||[];
- if(items.length){items.forEach(i=>{const x=document.createElement('span');x.textContent=i;owned.append(x);});}
- else {const x=document.createElement('span');x.className='muted';x.textContent='Core assumed on first update';owned.append(x);}
- const pending=threatState?.pending;$('pending').textContent=pending?.item?`Next update assumes: ${pending.action==='SWAP'?`${pending.replace} → `:''}${pending.item}`:'';
- const last=threatState?.last;
- if(last){$('action').textContent=last.action;$('item').textContent=last.action==='SWAP'?`${last.replace} → ${last.item}`:last.item||'Keep current build';$('reason').textContent=last.reason;}
- renderSend();
+const strengths=[['far-ahead','Far ahead'],['ahead','Ahead'],['equal','Equal'],['behind','Behind'],['far-behind','Far behind']];
+function renderStrength(){const root=$('strengthButtons');root.replaceChildren();for(const [id,label] of strengths){const b=document.createElement('button');b.className='strength-button'+(strength===id?' active':'');b.textContent=label;b.setAttribute('aria-pressed',String(strength===id));b.onclick=()=>{strength=id;dirty=true;renderStrength();};root.append(b);}}
+function renderSend(){const ready=!!device&&!!currentHero()&&enemies().length===5&&!busy;$('send').disabled=!ready;$('send').querySelector('span').textContent=busy?'Updating…':'Update build';}
+function itemIcon(name){const img=document.createElement('img');img.className='item-icon';img.alt='';img.loading='lazy';const slug=name.toLowerCase().replace(/[’']/g,'').replace(/[^a-z0-9]+/g,'_').replace(/^_|_$/g,'');img.src='/item-icons/'+slug+'.png';img.onerror=()=>{if(!img.dataset.fallback){img.dataset.fallback='remote';img.src='https://raw.githubusercontent.com/Ceplin03/database-mlbb.Mobile-Legends-Bang-Bang/master/logo-equipment/'+slug+'.png';}else if(img.dataset.fallback==='remote'){img.dataset.fallback='placeholder';img.src='/item-placeholder.svg';}};return img;}
+function renderRoute(){const root=$('buildRoute');root.replaceChildren();const route=threatState?.route;
+ if(!route?.items?.length){const empty=document.createElement('div');empty.className='empty';empty.textContent='Send an update to rank your eight recommended items.';root.append(empty);return;}
+ route.items.forEach((entry,i)=>{const card=document.createElement('div');card.className='build-item'+(i>=6?' alternative':'');
+ const number=document.createElement('span');number.className='build-number';number.textContent=i>=6?'ALT '+(i-5):String(i+1);card.append(number);
+ card.append(itemIcon(entry.item));const copy=document.createElement('div');copy.className='build-copy';const name=document.createElement('strong');name.textContent=entry.item;copy.append(name);const reason=document.createElement('small');reason.textContent=entry.against?.length?'vs '+entry.against.join(', '):entry.kind==='core'?'Core power spike':entry.kind==='offense'?'Damage / utility':'Situational';copy.append(reason);card.append(copy);card.title=entry.reason;root.append(card);});
+}
+function renderThreats(){const hero=currentHero();$('myHero').textContent=hero||'Select your hero';const route=threatState?.route;
+ if(route?.recommended?.length){$('action').textContent='TOP PRIORITY';$('item').textContent=route.recommended.slice(0,3).map(x=>x.item).join(' → ');$('reason').textContent=route.headline;}
+ else {$('action').textContent='READY';$('item').textContent='Select threats';$('reason').textContent='Rank eight items based on the matchup and your relative strength.';}
+ renderStrength();renderRoute();renderSend();
 }
 async function refresh(force=false){try{
  const d=device?await api(`/api/devices/${device.id}`):await api(`/api/games/${token}`);
  $('connection').textContent='● Connected';$('connection').style.color='#63d2a4';
  if(!force&&loaded&&d.revision===lastRevision)return;
- loaded=true;lastRevision=d.revision;roster=d.roster;threatState=d.threats;suggestedCore=d.suggestedCore||[];
+ loaded=true;lastRevision=d.revision;roster=d.roster;threatState=d.threats;if(!dirty)strength=threatState?.strength||'equal';
  if(!dirty){ratings={...(threatState?.ratings||{})};}renderBoard();renderThreats();
  }catch(e){$('connection').textContent='● Offline';$('connection').style.color='#f88a94';if(!loaded)labelStatus(e.message);}}
-$('send').onclick=async()=>{if(busy||!device)return;busy=true;renderSend();labelStatus('Calculating the best counter…');try{
- const d=await api(`/api/devices/${device.id}/threats`,'POST',{ratings});threatState=d.threats;dirty=false;lastRevision=-1;
- const push=d.delivery;labelStatus(push.delivered?`✓ Push delivered (${push.delivered})`:push.enabled?`Saved, but push not delivered (${push.errors?.[0]||'check subscription'})`:'Saved · enable push in settings');
+$('send').onclick=async()=>{if(busy||!device)return;busy=true;renderSend();labelStatus('Optimizing your 8-item route…');try{
+ const d=await api(`/api/devices/${device.id}/threats`,'POST',{ratings,strength});threatState=d.threats;dirty=false;lastRevision=-1;
+ const push=d.delivery;labelStatus(!d.change?.notify?'Build updated · no major change, no push':push.delivered?`✓ Build updated · push delivered (${push.delivered})`:push.enabled?`Build updated · push not delivered (${push.errors?.[0]||'check subscription'})`:'Build updated · enable push in settings');
  renderThreats();
  }catch(e){labelStatus('Error: '+e.message);}finally{busy=false;renderSend();refresh(true);}};
 function options(selected){return `<option value="">Select hero</option>`+allHeroes.map(h=>`<option value="${h.replaceAll('&','&amp;').replaceAll('"','&quot;')}"${h===selected?' selected':''}>${h.replaceAll('&','&amp;').replaceAll('<','&lt;')}</option>`).join('');}
@@ -55,10 +57,6 @@ $('saveDraft').onclick=async()=>{if(!device)return;const hero=$('heroSelect').va
   // A changed lineup invalidates the old build. Reset through New match for a fresh core.
   $('draftDialog').close();labelStatus('Draft saved. Send an update to get advice.');dirty=false;await refresh(true);
  }catch(e){$('draftStatus').textContent=e.message;}finally{$('saveDraft').disabled=false;}};
-function drawInventoryEditor(){const root=$('inventoryEditor');root.replaceChildren();(threatState?.assumed||[]).forEach(item=>{const b=document.createElement('button');b.textContent='✕ '+item;b.onclick=async()=>{try{const d=await api(`/api/devices/${device.id}/inventory`,'PATCH',{action:'remove',item});threatState=d.threats;renderThreats();drawInventoryEditor();}catch(e){labelStatus(e.message);}};root.append(b);});if(!root.children.length)root.textContent='No assumed items yet.';}
-$('editInventory').onclick=()=>{drawInventoryEditor();$('inventoryDialog').showModal();};
-$('closeInventory').onclick=()=>$('inventoryDialog').close();
-$('clearPending').onclick=async()=>{try{const d=await api(`/api/devices/${device.id}/inventory`,'PATCH',{action:'clear-pending'});threatState=d.threats;renderThreats();$('inventoryDialog').close();}catch(e){labelStatus(e.message);}};
 $('openSettings').onclick=()=>{$('settingsDialog').showModal();};$('closeSettings').onclick=()=>$('settingsDialog').close();
 function b64ToBytes(s){return Uint8Array.from(atob(s.replace(/-/g,'+').replace(/_/g,'/')),c=>c.charCodeAt(0));}
 async function serviceWorker(){if(!('serviceWorker'in navigator)||!('PushManager'in window))throw Error('Install this website to your iPhone Home Screen to enable push.');await navigator.serviceWorker.register('/sw.js');return navigator.serviceWorker.ready;}
@@ -67,7 +65,7 @@ $('disablePush').onclick=async()=>{try{const reg=await serviceWorker(),sub=await
 $('testPush').onclick=async()=>{try{const r=await api(`/api/devices/${device.id}/test-push`,'POST');$('pushStatus').textContent=`Test: ${r.delivery?.delivered||0} accepted / ${r.delivery?.attempted||0} attempted.`;}catch(e){$('pushStatus').textContent=e.message;}};
 let latestCode='';$('pair').onclick=async()=>{try{const d=await api(`/api/devices/${device.id}/pair-code`,'POST');latestCode=d.code;$('pairCode').textContent=latestCode;$('pairCode').hidden=false;$('copyCode').hidden=false;$('pairStatus').textContent='Code valid for 10 minutes.';}catch(e){$('pairStatus').textContent=e.message;}};
 $('copyCode').onclick=async()=>{try{await navigator.clipboard.writeText(latestCode);$('pairStatus').textContent='Code copied.';}catch(e){$('pairStatus').textContent=e.message;}};
-$('newMatch').onclick=async()=>{if(!confirm('Start a new match? This clears the draft, threat ratings and assumed inventory.'))return;try{await api(`/api/devices/${device.id}/new`,'POST');ratings={};dirty=false;lastRevision=-1;await refresh(true);labelStatus('New match ready. Send a loading-screen screenshot or Edit draft.');}catch(e){labelStatus(e.message);}};
+$('newMatch').onclick=async()=>{if(!confirm('Start a new match? This clears the draft, threat ratings and assumed inventory.'))return;try{await api(`/api/devices/${device.id}/new`,'POST');ratings={};strength='equal';dirty=false;lastRevision=-1;await refresh(true);labelStatus('New match ready. Send a loading-screen screenshot or Edit draft.');}catch(e){labelStatus(e.message);}};
 async function init(){try{const d=await api('/api/heroes');allHeroes=d.heroes||[];}catch{}
  if(!device){$('connection').textContent='Legacy session';labelStatus('Open the Home Screen app to use threat controls.');}
  await refresh(true);if(device){try{const d=await api(`/api/devices/${device.id}`);$('pairStatus').textContent=d.paired?'Screenshot Shortcut paired.':'Shortcut not paired. Use the pairing button below.';}catch{}
