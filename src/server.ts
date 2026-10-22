@@ -1,0 +1,74 @@
+import Fastify from 'fastify';
+import staticPlugin from '@fastify/static';
+import { readFile, stat } from 'node:fs/promises';
+import { resolve, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { createStore } from './db.js';
+import { createMcp } from './mcp.js';
+import { createStreamManager } from './stream.js';
+
+const root=fileURLToPath(new URL('../',import.meta.url));
+const store=createStore(process.env.DB_FILE||'./data/mlbb-coach.sqlite');
+const streams=createStreamManager(store);
+const app=Fastify({logger:true, bodyLimit: 16384});
+await app.register(staticPlugin,{root:join(root,'public'),prefix:'/'});
+const created=new Map<string,{count:number,until:number}>();
+function checkCreation(ip:string){ const now=Date.now();const prev=created.get(ip);if(!prev||now>prev.until){created.set(ip,{count:1,until:now+3600000});return true;}prev.count++;return prev.count<=15; }
+
+app.post('/api/games',async(req,reply)=>{
+  if(!checkCreation(req.ip))return reply.code(429).send({error:'Too many new sessions; retry later'});
+  const game=store.createGame();
+  store.setInstruction(game.token,'Waiting for draft screenshot and hero selection.');
+  return {token:game.token,message:`Use this token: ${game.token} to start the MLBB Item Coach Skill, to guide my game. I will give you instructions when hero selection is completed.`, url:`/game/${game.token}`};
+});
+app.get<{Params:{token:string}}>('/api/games/:token',async(req,reply)=>{
+  const game=store.getGame(req.params.token);if(!game)return reply.code(404).send({error:'Unknown token'});
+  reply.header('Cache-Control','no-store');
+  const latest=store.latestInstruction(game);
+  return {token:game.token,status:game.status,revision:game.revision,instruction:latest?.text??null,updatedAt:latest?.created_at??game.updated_at};
+});
+app.post<{Params:{token:string}}>('/api/games/:token/new',async(req,reply)=>{
+  try {const game=store.newRound(req.params.token);return {status:game.status,revision:game.revision};}
+  catch{return reply.code(404).send({error:'Unknown token'});}
+});
+app.get<{Params:{token:string}}>('/game/:token',async(req,reply)=>{
+  if(!store.getGame(req.params.token))return reply.code(404).send('Unknown token');
+  return reply.sendFile('game.html');
+});
+app.get<{Params:{token:string,filename:string}}>('/api/games/:token/hls/:filename',async(req,reply)=>{
+  if(!store.getGame(req.params.token))return reply.code(404).send('Unknown token');
+  if(!/^(index\.m3u8|part\d{6}\.ts)$/.test(req.params.filename))return reply.code(400).send('Invalid filename');
+  const dir=streams.start(req.params.token);if(!dir)return reply.code(404).send('Unknown token');
+  const path=join(dir,req.params.filename);
+  try {
+    // Playlist requires a moment to be produced when first requested.
+    let success=false;
+    for(let i=0;i<15;i++){
+      try {await stat(path);success=true;break;}catch{await new Promise(r=>setTimeout(r,250));}
+    }
+    if(!success)return reply.code(503).header('Retry-After','1').send('Stream warming up');
+    const body=await readFile(path);
+    reply.header('Cache-Control','no-store, no-cache, must-revalidate');
+    reply.header('Content-Type',req.params.filename.endsWith('.m3u8')?'application/vnd.apple.mpegurl':'video/mp2t');
+    return reply.send(body);
+  }catch {return reply.code(404).send('Segment unavailable');}
+});
+const apiKey=process.env.MCP_API_KEY;
+app.route({method:['GET','POST','DELETE'],url:'/mcp',handler:async(req,reply)=>{
+  if(apiKey&&req.headers.authorization!==`Bearer ${apiKey}`)return reply.code(401).send({error:'MCP authentication required'});
+  // Forward Fastify's raw request/response to the official transport.
+  // Fastify has already parsed JSON, so provide req.body for POST.
+  const {server,transport}=createMcp(store);
+  try {
+    await server.connect(transport);
+    reply.hijack();
+    await transport.handleRequest(req.raw,reply.raw,req.method==='POST'?req.body:undefined);
+  } catch(err) {
+    req.log.error(err);
+    if(!reply.raw.headersSent){reply.raw.statusCode=500;reply.raw.end('MCP request failed');}
+  } finally {await transport.close();await server.close();}
+}});
+app.get('/health',async()=>({ok:true}));
+app.addHook('onClose',async()=>{streams.close();store.db.close();});
+const port=Number(process.env.PORT||3000);const host=process.env.HOST||'127.0.0.1';
+await app.listen({port,host});
