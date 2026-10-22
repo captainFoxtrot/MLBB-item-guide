@@ -1,4 +1,4 @@
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -27,12 +27,8 @@ export function instructionSvg(text: string, status: string): string {
   <text x="34" y="119" font-family="Arial, sans-serif" font-size="28" font-weight="bold" fill="#f3f7ff">${tspans}</text>
   <text x="34" y="335" font-family="Arial, sans-serif" font-size="16" fill="#879bb7">Updated automatically from screenshot</text></svg>`;
 }
-type Running = {
-  process: ReturnType<typeof spawn>;
-  dir: string;
-  lastFetch: number;
-  closed: boolean;
-};
+
+type Running = { process: ReturnType<typeof spawn>; dir:string; lastFetch:number; closed:boolean };
 export function createStreamManager(store: Store) {
   const running = new Map<string,Running>();
   const stop = (token:string) => {
