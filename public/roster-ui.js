@@ -5,8 +5,22 @@ const device=saved?.id&&saved?.ownerKey&&saved?.gameToken===decodeURIComponent(l
 const pairSection=document.getElementById('pairSection');
 const dialog=document.getElementById('heroDialog'),search=document.getElementById('heroSearch'),choices=document.getElementById('heroChoices');
 let heroes=[],roster=null,editing=-1,latestCode='';
-const auth=()=>({'Authorization':'Bearer '+device.ownerKey,'Content-Type':'application/json'});
-async function api(path,opts={}){const r=await fetch(path,{...opts,headers:{...auth(),...(opts.headers||{})}}),v=await r.json();if(!r.ok)throw Error(v.error||'Request failed');return v;}
+const auth=()=>({'Authorization':'Bearer '+device.ownerKey});
+async function api(path,opts={}){
+  const headers = {
+    ...auth(),
+    ...(opts.body !== undefined
+      ? {'Content-Type':'application/json'}
+      : {}),
+    ...(opts.headers || {})
+  };
+
+  const r = await fetch(path,{...opts,headers});
+  const v = await r.json();
+
+  if(!r.ok) throw Error(v.error || 'Request failed');
+  return v;
+}
 const slotNode=(slot,i)=>{
  const node=document.createElement('div');node.className='hero-slot'+(roster.you===i?' is-you':'');
  const top=document.createElement('div');top.className='slot-top';
