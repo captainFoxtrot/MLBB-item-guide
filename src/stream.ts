@@ -25,7 +25,7 @@ export function instructionSvg(text: string, status: string): string {
   <text x="605" y="48" text-anchor="end" font-family="Arial, sans-serif" font-size="16" fill="#93a3ba">${escapeXml(status.toUpperCase())}</text>
   <line x1="34" y1="68" x2="606" y2="68" stroke="#2c3b53"/>
   <text x="34" y="119" font-family="Arial, sans-serif" font-size="28" font-weight="bold" fill="#f3f7ff">${tspans}</text>
-  <text x="34" y="335" font-family="Arial, sans-serif" font-size="16" fill="#879bb7">Updated from ChatGPT via MCP</text></svg>`;
+  <text x="34" y="335" font-family="Arial, sans-serif" font-size="16" fill="#879bb7">Updated automatically from screenshot</text></svg>`;
 }
 
 type Running = { process: ChildProcessWithoutNullStreams; dir:string; lastFetch:number; closed:boolean };

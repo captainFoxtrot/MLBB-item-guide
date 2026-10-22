@@ -1,103 +1,46 @@
-# MLBB Item Coach — Fastify + SQLite + MCP + experimental iPhone PiP
+# MLBB Item Coach — automatic screenshots, PiP or push (v2)
 
-This is a lightweight companion **server**, not an AI model. It stores one current instruction per game and exposes an MCP tool so your MLBB Item Coach Skill can update that instruction. A web page polls SQLite every **2 seconds**; a separate video stream redraws it about once a second and serves it as live HLS video for an iPhone Picture in Picture experiment.
-
-## Architecture
-
-`Web Start -> random token -> SQLite games / instructions -> MCP set_instruction(token,text) -> SQLite -> HLS generator (ffmpeg) -> Safari video / PiP`
-
-The token stays valid across games. **Closing PiP closes the viewer, not the token.** The HLS worker stops after ~90 seconds without stream requests. The viewer can be reopened later.
+Upgrade of the existing Fastify/SQLite/MCP/HLS project. No ChatGPT MCP plugin or paid OpenAI API is required. iOS Shortcut posts screenshots to a server-side free-tier vision provider (Groq primary, Gemini fallback); recommendation is stored in SQLite and appears in PiP or a Web Push notification.
 
 ## Requirements
 
-- Node.js 20+ (Node 22 recommended)
-- `ffmpeg` on PATH, built with `libx264` for the video overlay
-- HTTPS domain for use on iPhone (reverse proxy e.g. Caddy)
-- Install build tools if necessary for the `better-sqlite3` native addon
+Node >=20, FFmpeg (for PiP), HTTPS (already configured on mlbb.mtgrumble.com), at least one API key. Free-tier quotas/model availability can change. Confirm your model supports image input before deploying. Do not enable provider billing unless you intend to pay. Keep API keys on the server.
 
-## Quick start
+## Upgrade the existing Ubuntu instance
 
-```bash
-npm install
-cp .env.example .env
-npm run dev
-```
+1. **Back up** the current app and database (`/var/www/mlbb-item-guide/data/mlbb-coach.sqlite`, including SQLite WAL/SHM if present; safest is to stop the service first).
+2. Extract the new ZIP to `/var/www/mlbb-item-guide`, preserving `data/` and your existing `.env`. The DB migration is additive: creates `push_subscriptions` table. Existing games/instructions remain.
+3. `cd /var/www/mlbb-item-guide && npm install && npm run check && npm test`
+4. Configure environment variables in your systemd service using `EnvironmentFile=/var/www/mlbb-item-guide/.env` (or `Environment=` lines), then `sudo systemctl daemon-reload && sudo systemctl restart mlbb-coach.service`.
+5. Verify `curl https://mlbb.mtgrumble.com/health` and test with a real screenshot.
+6. To enable push, run `npx web-push generate-vapid-keys` **once**. Set `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT=mailto:YOUR_EMAIL`. Keep private key secret and persistent. If keys change, existing browser subscriptions must be renewed.
 
-Visit `http://127.0.0.1:3000`, press **Start a game**, copy the displayed message, and open the session's live display link.
+Set at least one of `GROQ_API_KEY` or `GEMINI_API_KEY`. `AI_PRIMARY=groq` by default. Defaults are `GROQ_MODEL=meta-llama/llama-4-scout-17b-16e-instruct` and `GEMINI_MODEL=gemini-2.5-flash-lite`; provider availability can change. On 429/errors, the next configured provider is attempted. API request timeout is 25 seconds per provider. No keys are ever sent to the browser.
 
-Set environment variables via your shell / process manager. **The sample `.env` is documentation, not automatically loaded.** For example:
+## One-tap iPhone Shortcut
 
-```bash
-HOST=0.0.0.0 PORT=3000 DB_FILE=./data/mlbb-coach.sqlite npm start
-```
-
-For an internet-facing deployment, terminate TLS with a reverse proxy and restrict access to `/mcp`. Keep port 3000 private; `HOST=127.0.0.1` behind the proxy is preferable. Do not publicly publish a bearer API key.
-
-## MCP connection
-
-- Streamable HTTP endpoint: `https://your-domain/mcp`
-- Four tools: `get_game`, `set_instruction`, `start_new_match`, `end_match`
-- `set_instruction({ "token":"<TOKEN>", "text":"NEXT: Athena's Shield — fed Eudora has burst; ..." })`
-- MCP is implemented using the v1 TypeScript SDK's **stateless Streamable HTTP transport** with JSON responses.
-
-**Important:** An MCP endpoint alone does not automatically appear inside ChatGPT. Configure an MCP-capable ChatGPT custom connector/app or other MCP client to connect to this server. That connection depends on the capabilities and policies of the ChatGPT client you use. After the tool is connected, your Skill can look up the user-provided token and publish advice with `set_instruction`.
-
-Optional: set `MCP_API_KEY` in the server environment to require `Authorization: Bearer <secret>` on `/mcp`. Your MCP client/connector must then supply that header. The browser only needs the game token and doesn't use the MCP key. This sample does **not** implement OAuth, per-user account access, or production identity management; implement an appropriate authorization scheme before offering it as a public multi-user service.
-
-### Suggested MLBB Coach Skill instructions
-
-When a user supplies a token, call `get_game`. After each draft screenshot or short update, produce: next suggested purchase, remaining core/situational progression, and a 1-paragraph reason. Call `set_instruction` with a concise, independently readable recommendation such as:
-
-> `NEXT: Athena's Shield. WHY: Eudora is fed and can burst you before you deal damage. Keep your completed damage core; buy magic burst protection now, then finish your next damage item.`
-
-Don't claim live telemetry. Only use user-supplied facts/screenshots and validated current game data. Confirm the player's hero, lane, matchup, current inventory, and relevant enemy threats when known. No server-side access to MLBB game state is included.
-
-## iPhone PiP notes
-
-The page shows a normal HTML instructions panel (reliable) and a **real HLS video** generated by `ffmpeg` (experimental). A native Safari video player may expose system PiP controls. Press the **Start Picture in Picture** button, or use the video's own controls. Whether live HLS and PiP survive switching to a specific game app **must be tested on your iPhone**. Some iOS/Safari versions may restrict web PiP, live playback, or autoplay. There is no arbitrary HTML overlay or custom PiP buttons; on incompatible devices the page remains usable as a normal display.
-
-The stream updates its visual frame at roughly 1 fps; the HLS pipeline can add several seconds of latency. The HTML panel updates from SQLite every 2 seconds.
+1. On `https://mlbb.mtgrumble.com`, create a match, choose PiP or Notifications, open the dashboard. **Treat the match token as a password.**
+2. In Apple Shortcuts create: **Take Screenshot → Get Contents of URL**. URL is `https://mlbb.mtgrumble.com/api/games/YOUR_TOKEN/analyze`. Set Method **POST**, Request Body **File** with Screenshot as the input. Set headers `X-MLBB-Token: YOUR_TOKEN` and `Content-Type: image/png` (or `image/jpeg` if converted to JPEG). Configure double Back Tap to trigger this Shortcut. Note: iOS Shortcuts capabilities and screenshots while playing vary by OS/game; test on your device.
+3. Screenshot is resized to fit 1400x1400 and sent to Groq/Gemini. AI chooses next item and explanation, then the server writes the instruction and sends push if subscribed.
+4. Match page polls the current advice every 2.5 seconds. PiP requires FFmpeg and working Safari HLS PiP. **iPhone PiP is not verified on-device and iOS may suspend playback or reject PiP.**
+5. For notifications, install the website using Safari **Share → Add to Home Screen**, launch from Home Screen, choose Notifications and tap Enable. Web Push on iOS requires iOS/iPadOS 16.4+ and a Home Screen web app; users must grant permission. Delivery is subject to iOS settings/Focus and not guaranteed instant. The server sends Web Push; the browser does not need to stay foregrounded.
 
 ## API
 
-| Method | Route | Purpose |
-|---|---|---|
-| POST | `/api/games` | Create game and return token + shareable starter prompt |
-| GET | `/api/games/:token` | Poll latest instruction + revision |
-| POST | `/api/games/:token/new` | Start next game using same token |
-| GET | `/game/:token` | Live viewer |
-| GET | `/api/games/:token/hls/index.m3u8` | On-demand live HLS playlist |
-| GET | `/api/games/:token/hls/partNNNNNN.ts` | Video segments |
-| GET/POST/DELETE | `/mcp` | MCP Streamable HTTP endpoint |
-| GET | `/health` | Health check |
+- `POST /api/games`: create game/token
+- `GET /api/games/:token`: latest instruction
+- `POST /api/games/:token/analyze`: **raw** PNG/JPEG/WebP bytes; header `X-MLBB-Token: TOKEN`; optional `X-Hero-Hint: Pharsa`; max 5 MiB; cooldown 12 seconds per token. Returns parsed recommendation and provider.
+- `GET /api/push/key`: public VAPID key and availability
+- `POST /api/games/:token/push`: JSON `{ "subscription": PushSubscription }`
+- `DELETE /api/games/:token/push`: JSON `{ "endpoint": "..." }`
+- `POST /api/games/:token/new`: start next round
+- `/mcp`: original MCP endpoint retained
+- `/health`: health check
 
-All endpoints except `/mcp` use the token as the bearer capability. Tokens are 18-character random hex values (72 bits) and should be treated as secrets. Do not share session links publicly. The current API does not distinguish view access from modification of `/new`; both actions require the token. There is no delete endpoint, no automatic match-end detection, and no scheduled token expiration. Before wider deployment, add scoped tokens, real authentication, and rate limits on **all** endpoints, not only session creation.
+## Operational considerations
 
-## Test locally
-
-```bash
-npm run check
-npm test
-npm run dev
-curl -fsS http://127.0.0.1:3000/health
-curl -fsS -X POST http://127.0.0.1:3000/api/games
-```
-
-In an MCP-capable client, connect to `/mcp`, call `get_game`, then `set_instruction`. Reload the live page and confirm the instruction changes without refresh. For PiP, verify on a physical iPhone with HTTPS and Safari.
-
-## Deployment example (Caddy)
-
-```caddyfile
-coach.example.com {
-    reverse_proxy 127.0.0.1:3000
-}
-```
-
-Run with an appropriate process manager (systemd, etc.) for persistence. Keep the SQLite database in a backed-up persistent volume. Ensure that `ffmpeg` is available to the service user. The server writes temporary HLS segments to the OS temp folder and deletes them when each worker stops.
-
-## Privacy / resource notes
-
-- No screenshots or game-state telemetry are uploaded or processed here. Only the text instruction and game token are stored.
-- Game records and instruction history persist in SQLite until manually removed.
-- Each active stream runs one `ffmpeg` process. This is a small personal prototype, not a high-scale multi-tenant video service.
-- Protect `/mcp` and rate limit at your reverse proxy for internet deployment.
+- **Privacy/security:** A match token grants read/write access and is visible in URL paths and possibly server logs. Use long random tokens (existing 18-character hex tokens), HTTPS, don't share links, consider adding per-user authentication before public launch. Provider API requests transmit screenshot images to the selected third party. Disable lock-screen notification previews if desired. Never commit `.env`.
+- **Rate limits:** 12-second cooldown and session creation throttle are basic protections, not complete abuse prevention. For a public multi-user service add global/IP quota, auth, bounded concurrent requests, daily usage caps, and user consent for third-party image processing. The current implementation has no automatic provider-spend cap; configure free-tier-only accounts.
+- **Model limitations:** Vision may misidentify hero, scoreboard details, items, or current meta. Verify game advice. No official MLBB live API is used. The model is instructed to report low confidence on unreadable screenshots.
+- **Push caveat:** MCP-originated `set_instruction` does not currently trigger push; automatic screenshot analyses do. Notifications are per match token and can be disabled from the match page.
+- **Testing:** `npm run check`, `npm test`, then a real iPhone test for Shortcut upload, PiP, Home Screen installation and push delivery. These platform behaviors cannot be validated from a Linux development container.

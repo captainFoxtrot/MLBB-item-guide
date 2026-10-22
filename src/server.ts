@@ -6,11 +6,15 @@ import { fileURLToPath } from 'node:url';
 import { createStore } from './db.js';
 import { createMcp } from './mcp.js';
 import { createStreamManager } from './stream.js';
+import { analyzeScreenshot } from './coach.js';
+import { createPush } from './push.js';
 
 const root=fileURLToPath(new URL('../',import.meta.url));
 const store=createStore(process.env.DB_FILE||'./data/mlbb-coach.sqlite');
 const streams=createStreamManager(store);
-const app=Fastify({logger:true, bodyLimit: 16384});
+const push=createPush(store);
+const analyses=new Map<string,number>();
+const app=Fastify({logger:true, bodyLimit: 5*1024*1024});
 await app.register(staticPlugin,{root:join(root,'public'),prefix:'/'});
 const created=new Map<string,{count:number,until:number}>();
 function checkCreation(ip:string){ const now=Date.now();const prev=created.get(ip);if(!prev||now>prev.until){created.set(ip,{count:1,until:now+3600000});return true;}prev.count++;return prev.count<=15; }
@@ -27,7 +31,32 @@ app.get<{Params:{token:string}}>('/api/games/:token',async(req,reply)=>{
   const latest=store.latestInstruction(game);
   return {token:game.token,status:game.status,revision:game.revision,instruction:latest?.text??null,updatedAt:latest?.created_at??game.updated_at};
 });
-app.post<{Params:{token:string}}>('/api/games/:token/new',async(req,reply)=>{
+app.get('/api/push/key',async()=>({publicKey:push.publicKey,enabled:push.enabled}));
+app.post<{Params:{token:string};Body:{subscription:{endpoint:string;keys:{p256dh:string;auth:string}}}}>('/api/games/:token/push',async(req,reply)=>{
+  if(!push.enabled)return reply.code(503).send({error:'Push not configured'});
+  const sub=req.body?.subscription;
+  if(!sub||typeof sub.endpoint!=='string'||!sub.endpoint.startsWith('https://')||!sub.keys?.p256dh||!sub.keys?.auth)return reply.code(400).send({error:'Invalid subscription'});
+  try{store.addSubscription(req.params.token,sub);return {ok:true};}catch{return reply.code(404).send({error:'Unknown token'});}
+});
+app.delete<{Params:{token:string};Body:{endpoint:string}}>('/api/games/:token/push',async(req,reply)=>{
+  if(!store.getGame(req.params.token))return reply.code(404).send({error:'Unknown token'});
+  const endpoint=req.body?.endpoint;
+  if(typeof endpoint!=='string'||!store.getSubscriptions(req.params.token).some(s=>s.endpoint===endpoint))return reply.code(404).send({error:'Subscription not found'});
+  store.deleteSubscription(endpoint);return {ok:true};
+});
+// iOS Shortcut: Get Contents of URL, POST raw JPEG/PNG bytes, X-MLBB-Token header.
+app.addContentTypeParser(['image/jpeg','image/png','image/webp','application/octet-stream'],{parseAs:'buffer',bodyLimit:5*1024*1024},(_req,body,done)=>done(null,body));
+app.post<{Params:{token:string};Body:Buffer;Headers:{'x-mlbb-token'?:string;'x-hero-hint'?:string}}>('/api/games/:token/analyze',async(req,reply)=>{
+  const token=req.params.token.toUpperCase();
+  if(req.headers['x-mlbb-token']!==token)return reply.code(401).send({error:'Session token header required'});
+  const game=store.getGame(token);if(!game||game.status!=='active')return reply.code(404).send({error:'Active game not found'});
+  if(!Buffer.isBuffer(req.body)||req.body.length<1000)return reply.code(400).send({error:'Upload screenshot bytes as JPEG or PNG'});
+  const last=analyses.get(token)||0;if(Date.now()-last<12000)return reply.code(429).send({error:'Wait 12 seconds between analyses'});
+  analyses.set(token,Date.now());
+  try{const result=await analyzeScreenshot(store,token,req.body,req.headers['x-hero-hint']);await push.notify(token,result.instruction);return result;}
+  catch(err){req.log.error(err);return reply.code(502).send({error:err instanceof Error?err.message:'AI analysis failed'});}
+});
+app.post<{Params:{token:string}}>('/api/games/:token/new' ,async(req,reply)=>{
   try {const game=store.newRound(req.params.token);return {status:game.status,revision:game.revision};}
   catch{return reply.code(404).send({error:'Unknown token'});}
 });

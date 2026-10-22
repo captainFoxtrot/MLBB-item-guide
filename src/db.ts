@@ -22,6 +22,12 @@ export function createStore(file: string) {
       id INTEGER PRIMARY KEY, game_id INTEGER NOT NULL REFERENCES games(id),
       text TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
+    CREATE TABLE IF NOT EXISTS push_subscriptions (
+      id INTEGER PRIMARY KEY, game_id INTEGER NOT NULL REFERENCES games(id),
+      endpoint TEXT NOT NULL UNIQUE, subscription TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS ix_push_game ON push_subscriptions(game_id);
     CREATE INDEX IF NOT EXISTS ix_instructions_game ON instructions(game_id, id DESC);
   `);
   const get = db.prepare('SELECT * FROM games WHERE token = ?');
@@ -54,6 +60,16 @@ export function createStore(file: string) {
         updateGame.run(game.id);
         return { game: get.get(game.token) as Game, instruction: latest.get(game.id) as Instruction };
       })();
+    },
+    addSubscription(token:string, sub:{endpoint:string}) {
+      const game=get.get(token.toUpperCase()) as Game|undefined;
+      if(!game)throw Error('Unknown game');
+      db.prepare('INSERT INTO push_subscriptions(game_id,endpoint,subscription) VALUES (?,?,?) ON CONFLICT(endpoint) DO UPDATE SET game_id=excluded.game_id,subscription=excluded.subscription').run(game.id,sub.endpoint,JSON.stringify(sub));
+    },
+    deleteSubscription(endpoint:string){db.prepare('DELETE FROM push_subscriptions WHERE endpoint=?').run(endpoint);},
+    getSubscriptions(token:string):Array<{endpoint:string;subscription:string}>{
+      const game=get.get(token.toUpperCase()) as Game|undefined;
+      return game?db.prepare('SELECT endpoint,subscription FROM push_subscriptions WHERE game_id=?').all(game.id) as Array<{endpoint:string;subscription:string}>:[];
     },
     newRound(token: string) {
       return db.transaction(() => {
