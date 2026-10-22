@@ -8,17 +8,74 @@ import { createMcp } from './mcp.js';
 import { createStreamManager } from './stream.js';
 import { analyzeScreenshot } from './coach.js';
 import { createPush } from './push.js';
+import { HEROES } from './roster.js';
+import { authorizeOwner } from './device.js';
 
 const root=fileURLToPath(new URL('../',import.meta.url));
 const store=createStore(process.env.DB_FILE||'./data/mlbb-coach.sqlite');
 const streams=createStreamManager(store);
 const push=createPush(store);
 const analyses=new Map<string,number>();
-const app=Fastify({logger:true, bodyLimit: 5*1024*1024});
+const app=Fastify({logger:true, bodyLimit: 10*1024*1024});
 await app.register(staticPlugin,{root:join(root,'public'),prefix:'/'});
 const created=new Map<string,{count:number,until:number}>();
 function checkCreation(ip:string){ const now=Date.now();const prev=created.get(ip);if(!prev||now>prev.until){created.set(ip,{count:1,until:now+3600000});return true;}prev.count++;return prev.count<=15; }
 
+// v2.1: browser owns a device, while the iPhone Shortcut holds a separate capture credential.
+app.get('/api/heroes',async()=>({heroes:HEROES}));
+app.get('/api/setup',async()=>({shortcutInstallUrl:process.env.SHORTCUT_INSTALL_URL||null}));
+app.post('/api/devices',async(req,reply)=>{
+ if(!checkCreation(req.ip))return reply.code(429).send({error:'Too many devices created'});
+ const d=store.createDevice();reply.header('Cache-Control','no-store');return d;
+});
+function owner(req:any,reply:any){const d=authorizeOwner(store,req.params.id,req.headers.authorization);if(!d){reply.code(401).send({error:'Device owner authentication required'});return null;}return d;}
+app.get<{Params:{id:string}}>('/api/devices/:id',async(req,reply)=>{
+ const d=owner(req,reply);if(!d)return;
+ const game=store.getGame(d.game_token)!;const latest=store.latestInstruction(game);
+ reply.header('Cache-Control','no-store');
+ return {id:d.id,paired:!!d.capture_hash,gameToken:game.token,status:game.status,revision:game.revision,instruction:latest?.text||null,roster:store.getRoster(game.token)};
+});
+app.post<{Params:{id:string}}>('/api/devices/:id/pair-code',async(req,reply)=>{
+ const d=owner(req,reply);if(!d)return;
+ reply.header('Cache-Control','no-store');return store.newPairingCode(d.id);
+});
+app.post<{Body:{code:string}}>('/api/devices/claim',async(req,reply)=>{
+ const code=req.body?.code;
+ if(typeof code!=='string')return reply.code(400).send({error:'Pairing code required'});
+ const result=store.claimPairingCode(code);
+ if(!result)return reply.code(401).send({error:'Pairing code expired or invalid'});
+ reply.header('Cache-Control','no-store');return result;
+});
+app.delete<{Params:{id:string}}>('/api/devices/:id/pair',async(req,reply)=>{
+ const d=owner(req,reply);if(!d)return;
+ store.revokeCapture(d.id);return {ok:true};
+});
+app.post<{Params:{id:string}}>('/api/devices/:id/new',async(req,reply)=>{
+ const d=owner(req,reply);if(!d)return;
+ const game=store.newRound(d.game_token);return {gameToken:game.token,revision:game.revision};
+});
+app.patch<{Params:{id:string};Body:{index?:number;hero?:string|null;you?:number|null}}>('/api/devices/:id/roster',async(req,reply)=>{
+ const d=owner(req,reply);if(!d)return;
+ const body=req.body;
+ if(!body||typeof body!=='object'||(!Object.hasOwn(body,'index')&&!Object.hasOwn(body,'you')))return reply.code(400).send({error:'index or you required'});
+ try{return {roster:store.updateRosterManual(d.game_token,body)};}
+ catch(e){return reply.code(400).send({error:e instanceof Error?e.message:'Invalid roster'});}
+});
+// Device capture is independent of a match token. The server resolves the current match.
+app.post<{Body:Buffer;Headers:{authorization?:string;'x-hero-hint'?:string}}>('/api/devices/capture',async(req,reply)=>{
+ const key=req.headers.authorization?.replace(/^Bearer\s+/i,'');
+ const device=key?store.getDeviceByCapture(key):undefined;
+ if(!device)return reply.code(401).send({error:'Device pairing required'});
+ const token=device.game_token;const game=store.getGame(token);
+ if(!game||game.status!=='active')return reply.code(409).send({error:'No active match'});
+ if(!Buffer.isBuffer(req.body)||req.body.length<1000)return reply.code(400).send({error:'Upload raw PNG/JPEG image'});
+ const last=analyses.get(token)||0;if(Date.now()-last<12000)return reply.code(429).send({error:'Wait 12 seconds between analyses'});
+ analyses.set(token,Date.now());
+ try{const result=await analyzeScreenshot(store,token,req.body,req.headers['x-hero-hint']);
+   if(result.screen==='scoreboard'&&result.confidence!=='low'&&result.nextItem!=='Need clearer scoreboard'&&store.getRoster(token).you!==null)await push.notify(token,result.instruction);
+   return result;
+ }catch(err){req.log.error(err);return reply.code(502).send({error:err instanceof Error?err.message:'AI analysis failed'});}
+});
 app.post('/api/games',async(req,reply)=>{
   if(!checkCreation(req.ip))return reply.code(429).send({error:'Too many new sessions; retry later'});
   const game=store.createGame();
@@ -29,7 +86,7 @@ app.get<{Params:{token:string}}>('/api/games/:token',async(req,reply)=>{
   const game=store.getGame(req.params.token);if(!game)return reply.code(404).send({error:'Unknown token'});
   reply.header('Cache-Control','no-store');
   const latest=store.latestInstruction(game);
-  return {token:game.token,status:game.status,revision:game.revision,instruction:latest?.text??null,updatedAt:latest?.created_at??game.updated_at};
+  return {token:game.token,status:game.status,revision:game.revision,instruction:latest?.text??null,updatedAt:latest?.created_at??game.updated_at,roster:store.getRoster(game.token)};
 });
 app.get('/api/push/key',async()=>({publicKey:push.publicKey,enabled:push.enabled}));
 app.post<{Params:{token:string};Body:{subscription:{endpoint:string;keys:{p256dh:string;auth:string}}}}>('/api/games/:token/push',async(req,reply)=>{
@@ -45,7 +102,7 @@ app.delete<{Params:{token:string};Body:{endpoint:string}}>('/api/games/:token/pu
   store.deleteSubscription(endpoint);return {ok:true};
 });
 // iOS Shortcut: Get Contents of URL, POST raw JPEG/PNG bytes, X-MLBB-Token header.
-app.addContentTypeParser(['image/jpeg','image/png','image/webp','application/octet-stream'],{parseAs:'buffer',bodyLimit:5*1024*1024},(_req,body,done)=>done(null,body));
+app.addContentTypeParser(['image/jpeg','image/png','image/webp','application/octet-stream'],{parseAs:'buffer',bodyLimit:10*1024*1024},(_req,body,done)=>done(null,body));
 app.post<{Params:{token:string};Body:Buffer;Headers:{'x-mlbb-token'?:string;'x-hero-hint'?:string}}>('/api/games/:token/analyze',async(req,reply)=>{
   const token=req.params.token.toUpperCase();
   if(req.headers['x-mlbb-token']!==token)return reply.code(401).send({error:'Session token header required'});
@@ -53,7 +110,7 @@ app.post<{Params:{token:string};Body:Buffer;Headers:{'x-mlbb-token'?:string;'x-h
   if(!Buffer.isBuffer(req.body)||req.body.length<1000)return reply.code(400).send({error:'Upload screenshot bytes as JPEG or PNG'});
   const last=analyses.get(token)||0;if(Date.now()-last<12000)return reply.code(429).send({error:'Wait 12 seconds between analyses'});
   analyses.set(token,Date.now());
-  try{const result=await analyzeScreenshot(store,token,req.body,req.headers['x-hero-hint']);await push.notify(token,result.instruction);return result;}
+  try{const result=await analyzeScreenshot(store,token,req.body,req.headers['x-hero-hint']);if(result.screen==='scoreboard'&&result.confidence!=='low'&&result.nextItem!=='Need clearer scoreboard'&&store.getRoster(token).you!==null)await push.notify(token,result.instruction);return result;}
   catch(err){req.log.error(err);return reply.code(502).send({error:err instanceof Error?err.message:'AI analysis failed'});}
 });
 app.post<{Params:{token:string}}>('/api/games/:token/new' ,async(req,reply)=>{
