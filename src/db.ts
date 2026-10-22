@@ -2,6 +2,7 @@ import Database from 'better-sqlite3';
 import { randomBytes } from 'node:crypto';
 import { blankRoster, normalizeHero, type Roster, type Screen } from './roster.js';
 import { digest, secret } from './device.js';
+import { emptyThreatState, type ThreatState } from './threat-coach.js';
 import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 
@@ -43,6 +44,7 @@ export function createStore(file: string) {
     CREATE TABLE IF NOT EXISTS hero_rosters (
       game_id INTEGER PRIMARY KEY REFERENCES games(id), roster_json TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS threat_states (game_id INTEGER PRIMARY KEY REFERENCES games(id), state_json TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS game_analyses (
       game_id INTEGER PRIMARY KEY REFERENCES games(id), result_json TEXT NOT NULL,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -104,6 +106,16 @@ export function createStore(file: string) {
         ON CONFLICT(game_id) DO UPDATE SET result_json=excluded.result_json,updated_at=CURRENT_TIMESTAMP`)
         .run(game.id,JSON.stringify(result));
     },
+    getThreatState(token:string):ThreatState {
+      const game=this.getGame(token);if(!game)throw Error('Unknown game');
+      const row=db.prepare('SELECT state_json FROM threat_states WHERE game_id=?').get(game.id) as {state_json:string}|undefined;
+      return row?JSON.parse(row.state_json) as ThreatState:emptyThreatState();
+    },
+    saveThreatState(token:string,state:ThreatState){
+      const game=this.getGame(token);if(!game||game.status!=='active')throw Error('No active game');
+      db.prepare('INSERT INTO threat_states(game_id,state_json) VALUES (?,?) ON CONFLICT(game_id) DO UPDATE SET state_json=excluded.state_json').run(game.id,JSON.stringify(state));
+      updateGame.run(game.id);return state;
+    },
     getRoster(token:string):Roster {
       const game=this.getGame(token);if(!game)throw Error('Unknown game');
       const row=db.prepare('SELECT roster_json FROM hero_rosters WHERE game_id=?').get(game.id) as {roster_json:string}|undefined;
@@ -128,6 +140,11 @@ export function createStore(file: string) {
       if(Object.hasOwn(change,'you')){
         if(change.you!==null&&(typeof change.you!=='number'||!Number.isInteger(change.you)||change.you<0||change.you>4))throw Error('You must be an ally slot (0-4)');
         roster.you=change.you??null;roster.youLocked=true;
+      }
+      // A changed hero or enemy invalidates the assumed build and threat ratings.
+      const previous=this.getRoster(token);
+      if(previous.you!==roster.you || previous.slots.some((s,i)=> (i===previous.you||i===roster.you||i>=5) && s.hero!==roster.slots[i].hero)){
+        const game=this.getGame(token)!;db.prepare('DELETE FROM threat_states WHERE game_id=?').run(game.id);
       }
       return this.saveRoster(token,roster);
     },
@@ -204,6 +221,7 @@ export function createStore(file: string) {
         insertInstruction.run(game.id, 'New match started. Awaiting hero selection and draft screenshot.');
         db.prepare('DELETE FROM hero_rosters WHERE game_id=?').run(game.id);
         db.prepare('DELETE FROM game_analyses WHERE game_id=?').run(game.id);
+        db.prepare('DELETE FROM threat_states WHERE game_id=?').run(game.id);
         updateGame.run(game.id);
         return get.get(game.token) as Game;
       })();

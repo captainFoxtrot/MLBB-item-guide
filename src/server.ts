@@ -10,13 +10,27 @@ import { analyzeScreenshot } from './coach.js';
 import { createPush } from './push.js';
 import { HEROES } from './roster.js';
 import { authorizeOwner } from './device.js';
+import { applyPending, candidates, decide, enemyFromRoster, heroFromRoster, initialCore, type Rating } from './threat-coach.js';
 
 const root=fileURLToPath(new URL('../',import.meta.url));
 const store=createStore(process.env.DB_FILE||'./data/mlbb-coach.sqlite');
 const streams=createStreamManager(store);
 const push=createPush(store);
 const analyses=new Map<string,number>();
+const threatRequests=new Set<string>();
 async function publishAdvice(token:string,result:Awaited<ReturnType<typeof analyzeScreenshot>>){
+  // Loading-screen screenshots establish a baseline core, not an assumed purchase.
+  // Threat-button updates later handle all adaptive NEXT/SWAP/KEEP decisions.
+  const hero=heroFromRoster(store.getRoster(token));
+  if(hero&&(result.screen==='draft'||result.screen==='loading')){
+    const core=initialCore(hero);
+    const instruction=`CORE: ${core.join(' > ')} — baseline; adapt with threat ratings`;
+    const previous=store.latestInstruction(store.getGame(token)!)?.text;
+    result.coreItems=core;result.nextItem=core[0];result.reason='Baseline core; mark enemy threats after completing it';
+    result.adviceType='core';result.adviceStatus='provisional';result.instruction=instruction;
+    result.notificationQueued=previous!==instruction;
+    if(previous!==instruction)store.setInstruction(token,instruction);
+  }
   if(result.notificationQueued){
     const title=result.adviceType==='core'?'MLBB Coach · Core':'MLBB Coach · Next item';
     result.notification=await push.notify(token,title,`${result.nextItem} - ${result.reason}`);
@@ -43,7 +57,7 @@ app.get<{Params:{id:string}}>('/api/devices/:id',async(req,reply)=>{
  const d=owner(req,reply);if(!d)return;
  const game=store.getGame(d.game_token)!;const latest=store.latestInstruction(game);
  reply.header('Cache-Control','no-store');
- return {id:d.id,paired:!!d.capture_hash,gameToken:game.token,status:game.status,revision:game.revision,instruction:latest?.text||null,roster:store.getRoster(game.token),analysis:store.getLatestAnalysis(game.token)};
+ return {id:d.id,paired:!!d.capture_hash,gameToken:game.token,status:game.status,revision:game.revision,instruction:latest?.text||null,roster:store.getRoster(game.token),analysis:store.getLatestAnalysis(game.token),threats:store.getThreatState(game.token),suggestedCore:heroFromRoster(store.getRoster(game.token))?initialCore(heroFromRoster(store.getRoster(game.token))!):[]};
 });
 app.post<{Params:{id:string}}>('/api/devices/:id/pair-code',async(req,reply)=>{
  const d=owner(req,reply);if(!d)return;
@@ -71,6 +85,53 @@ app.patch<{Params:{id:string};Body:{index?:number;hero?:string|null;you?:number|
  try{return {roster:store.updateRosterManual(d.game_token,body)};}
  catch(e){return reply.code(400).send({error:e instanceof Error?e.message:'Invalid roster'});}
 });
+// v3: one loading screenshot, then explicit enemy threat ratings and a stateful assumed inventory.
+app.post<{Params:{id:string};Body:{ratings?:Record<string,Rating>}}>('/api/devices/:id/threats',async(req,reply)=>{
+ const d=owner(req,reply);if(!d)return;
+ const token=d.game_token,roster=store.getRoster(token),hero=heroFromRoster(roster);
+ if(!hero)return reply.code(409).send({error:'Select your hero in Edit draft first'});
+ const enemies=roster.slots.slice(5).map(s=>s.hero).filter((s):s is string=>!!s);
+ if(enemies.length!==5)return reply.code(409).send({error:'Identify all five enemies in Edit draft first'});
+ const ratings=req.body?.ratings;
+ if(!ratings||typeof ratings!=='object'||Array.isArray(ratings))return reply.code(400).send({error:'Threat ratings required'});
+ if(Object.keys(ratings).some(h=>!enemies.includes(h)||![null,'weak','gaining','strong'].includes(ratings[h])))return reply.code(400).send({error:'Invalid hero or rating'});
+ if(threatRequests.has(token))return reply.code(409).send({error:'Recommendation already processing'});
+ threatRequests.add(token);
+ try{
+  let state=store.getThreatState(token);
+  if(!state.initialized){state.core=initialCore(hero);state.assumed=[...state.core];state.initialized=true;}
+  else state=applyPending(state);
+  state.ratings=Object.fromEntries(enemies.map(h=>[h,ratings[h]||null]));
+  const decision=decide(hero,enemyFromRoster(roster,state.ratings),state.assumed,state.core);
+  state.pending=decision.action==='KEEP'?null:decision;
+  state.last=decision;
+  state.history.push({at:new Date().toISOString(),decision});
+  if(state.history.length>30)state.history=state.history.slice(-30);
+  const instruction=decision.action==='KEEP'?'KEEP: '+decision.reason:decision.action==='SWAP'?`SWAP: ${decision.replace} → ${decision.item} — ${decision.reason}`:`NEXT: ${decision.item} — ${decision.reason}`;
+  store.setInstruction(token,instruction.slice(0,750));
+  // Save the decision before sending so a failed push does not erase the progression.
+  store.saveThreatState(token,state);
+  const delivery=await push.notify(token,`MLBB Coach · ${decision.action}`,instruction.slice(0,220));
+  return {ok:true,hero,decision,assumed:state.assumed,pending:state.pending,delivery,threats:state};
+ }catch(e){req.log.error(e);return reply.code(500).send({error:e instanceof Error?e.message:'Coaching failed'});}
+ finally{threatRequests.delete(token);}
+});
+app.patch<{Params:{id:string};Body:{action:'add'|'remove'|'clear-pending';item?:string}}>('/api/devices/:id/inventory',async(req,reply)=>{
+ const d=owner(req,reply);if(!d)return;
+ const state=store.getThreatState(d.game_token),body=req.body;
+ if(!body||!['add','remove','clear-pending'].includes(body.action))return reply.code(400).send({error:'Invalid action'});
+ if(body.action==='clear-pending')state.pending=null;
+ else{
+  const item=body.item;
+  const roster=store.getRoster(d.game_token),hero=heroFromRoster(roster);
+  if(!hero)return reply.code(409).send({error:'Select your hero first'});
+  const valid=new Set([...initialCore(hero),...candidates(hero,enemyFromRoster(roster,state.ratings)).map(c=>c.item),...(state.pending?.item?[state.pending.item]:[])]);
+  if(!item||!valid.has(item))return reply.code(400).send({error:'Unknown item'});
+  if(body.action==='remove'){state.assumed=state.assumed.filter(i=>i!==item);if(state.pending?.item===item)state.pending=null;}
+  if(body.action==='add'&&!state.assumed.includes(item)){if(state.assumed.length>=6)return reply.code(409).send({error:'Inventory full: remove an item first'});state.assumed.push(item);}
+ }
+ store.saveThreatState(d.game_token,state);return {ok:true,threats:state};
+});
 // Device capture is independent of a match token. The server resolves the current match.
 app.post<{Body:Buffer;Headers:{authorization?:string;'x-hero-hint'?:string}}>('/api/devices/capture',async(req,reply)=>{
  const key=req.headers.authorization?.replace(/^Bearer\s+/i,'');
@@ -95,7 +156,7 @@ app.get<{Params:{token:string}}>('/api/games/:token',async(req,reply)=>{
   const game=store.getGame(req.params.token);if(!game)return reply.code(404).send({error:'Unknown token'});
   reply.header('Cache-Control','no-store');
   const latest=store.latestInstruction(game);
-  return {token:game.token,status:game.status,revision:game.revision,instruction:latest?.text??null,updatedAt:latest?.created_at??game.updated_at,roster:store.getRoster(game.token),analysis:store.getLatestAnalysis(game.token)};
+  return {token:game.token,status:game.status,revision:game.revision,instruction:latest?.text??null,updatedAt:latest?.created_at??game.updated_at,roster:store.getRoster(game.token),analysis:store.getLatestAnalysis(game.token),threats:store.getThreatState(game.token),suggestedCore:heroFromRoster(store.getRoster(game.token))?initialCore(heroFromRoster(store.getRoster(game.token))!):[]};
 });
 app.get('/api/push/key',async()=>({publicKey:push.publicKey,enabled:push.enabled}));
 app.get<{Params:{id:string}}>('/api/devices/:id/push-status',async(req,reply)=>{
@@ -136,6 +197,7 @@ app.post<{Params:{token:string}}>('/api/games/:token/new' ,async(req,reply)=>{
   try {const game=store.newRound(req.params.token);return {status:game.status,revision:game.revision};}
   catch{return reply.code(404).send({error:'Unknown token'});}
 });
+app.get<{Params:{token:string}}>('/classic/:token',async(req,reply)=>{if(!store.getGame(req.params.token))return reply.code(404).send('Unknown token');return reply.sendFile('classic.html');});
 app.get<{Params:{token:string}}>('/game/:token',async(req,reply)=>{
   if(!store.getGame(req.params.token))return reply.code(404).send('Unknown token');
   return reply.sendFile('game.html');

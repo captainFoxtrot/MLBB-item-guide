@@ -1,0 +1,11 @@
+import { test } from 'node:test';
+import { strict as assert } from 'node:assert';
+import { applyPending, decide, emptyThreatState, initialCore } from '../src/threat-coach.js';
+test('Miya core is three items including boots',()=>{const core=initialCore('Miya');assert.equal(core.length,3);assert(core[0].includes('Boots'));});
+test('Strong Karina gets magic protection, not Wind of Nature',()=>{const core=initialCore('Miya');const d=decide('Miya',[{hero:'Karina',rating:'strong'},{hero:'Hanabi',rating:'gaining'}],core,core);assert.equal(d.action,'NEXT');assert.equal(d.item,'Rose Gold Meteor');});
+test('Weak Karina does not trigger dedicated magic protection',()=>{const core=initialCore('Miya');const d=decide('Miya',[{hero:'Karina',rating:'weak'}],core,core);assert.notEqual(d.item,'Rose Gold Meteor');});
+test('Strong Hanabi prompts physical protection',()=>{const core=initialCore('Miya');const d=decide('Miya',[{hero:'Hanabi',rating:'strong'}],core,core);assert.equal(d.item,'Wind of Nature');});
+test('Estes prompts physical antiheal for Miya',()=>{const core=initialCore('Miya');const d=decide('Miya',[{hero:'Estes',rating:'strong'}],core,core);assert.equal(d.item,'Sea Halberd');});
+test('Pending item becomes assumed on next request, never duplicated',()=>{let s=emptyThreatState();s.core=initialCore('Miya');s.assumed=[...s.core];s.initialized=true;s.pending=decide('Miya',[{hero:'Karina',rating:'strong'}],s.assumed,s.core);s=applyPending(s);assert(s.assumed.includes('Rose Gold Meteor'));assert.equal(s.assumed.length,4);const next=decide('Miya',[{hero:'Karina',rating:'strong'}],s.assumed,s.core);assert.notEqual(next.item,'Rose Gold Meteor');});
+test('Full inventory returns KEEP without urgent threat',()=>{const core=initialCore('Miya'),owned=[...core,'Rose Gold Meteor','Wind of Nature','Sea Halberd'];const d=decide('Miya',[{hero:'Karina',rating:'weak'}],owned,core);assert.equal(d.action,'KEEP');});
+test('Full inventory may swap adaptive slot against strong threat',()=>{const core=initialCore('Miya'),owned=[...core,'Golden Staff','Sea Halberd','Malefic Roar'];const d=decide('Miya',[{hero:'Karina',rating:'strong'}],owned,core);assert.equal(d.action,'SWAP');assert.equal(d.item,'Rose Gold Meteor');assert(!core.includes(d.replace!));});
